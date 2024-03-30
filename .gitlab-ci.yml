@@ -1,0 +1,237 @@
+#include the SAST template to test our apps security
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+
+#Define the different stages of the CICD pipeline, we will use the image "hashicorp/terraform:1.7.5" for all the jobs unless we define another.
+image:
+  name: hashicorp/terraform:1.7.5
+  entrypoint:
+  - '/usr/bin/env'
+  - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+stages:
+  - test
+  - Build and Push
+  - Staging Plan
+  - Staging Apply
+  - Staging Test
+  - Production Plan
+  - Production Apply
+  - Production Test
+  - Destroy
+
+
+# Test the linting of the terraform code; when?
+#   - Merge request to main or production branch
+#   - Merge from other branch into main | production or a direct push into main | production
+# 1) Initialise terraform, dont't use s3 backend (Not needed for validation)
+# 2) Validate the terraform code 
+# 3) Check terraform linting
+
+
+Validate Terraform:
+  stage: test
+  script:
+    - echo "Validate Terraform"
+    - cd deploy/
+    - terraform init -backend=false
+    - terraform validate
+    - terraform fmt -check
+  rules:
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(main|production)$/ || $CI_COMMIT_BRANCH =~ /^(main|production)$/'
+
+# Build the docker-image of the flask_app using the DIND service and push the image to ECR; when?
+#   - Merge from other branch into main | production or a direct push into main | production
+# 1) add python and install a virtual environment
+# 2) Activate the virtual environment
+# 3) Install the AWS CLI via pip3
+# 4) Built the image & tag it whith the $CI_COMMIT_SHORT_SHA tag for an exact reference
+# 5) Authenticate to AWS using AWS CLI
+# 6) Tag the image with the tag corresponding with the ECR repo
+# 7) Push the image to the ECR
+
+Build and Push:
+  stage: Build and Push
+  image: docker:25.0.4
+  services:
+    - docker:25.0.4-dind
+  script:
+    - echo "Build and Push docker image"
+    - apk add python3
+    - apk add py3-pip
+    - python3 -m venv venv
+    - source venv/bin/activate
+    - pip3 install awscli
+    - docker build --compress -t $ECR_REPO:$CI_COMMIT_SHORT_SHA app/.
+    - $(aws ecr get-login --no-include-email --region us-east-1)
+    - docker push $ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - docker tag $ECR_REPO:$CI_COMMIT_SHORT_SHA $ECR_REPO:latest
+    - docker push $ECR_REPO:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|production)$/'
+
+
+# Run terraform plan for the staging environment; when?
+#   - Merge from other branch into main | production or a direct push into main | production; why also in production? We want to keep our staging environment identical to the production environment
+# 1) Export $ECR_REPO:$CI_COMMIT_SHORT_SHA as TF_VAR_ecr_image_api environment variable (Referenced in the terraform code)
+# 2) Initialise terraform, using s3 backend
+# 3) Select the terraform workspace staging, if it does not exist ---> create the workspace staging
+# 4) Execute terraform plan using the variables-file 00-project.tfvars, the purpose of using the "-var-file=":
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+Staging Plan:
+  stage: Staging Plan
+  script:
+    - echo "Run Terraform Plan for Staging"
+    - cd deploy/
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - terraform init
+    - terraform workspace select staging || terraform workspace new staging
+    - terraform plan -var-file="00-project.tfvars"
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|production)$/'
+
+# Run terraform apply for the staging environment; when?
+#   - Merge from other branch into main | production or a direct push into main | production; why also in production? We want to keep our staging environment identical to the production environment
+# 1) Export $ECR_REPO:$CI_COMMIT_SHORT_SHA as TF_VAR_ecr_image_api environment variable (Referenced in the terraform code)
+# 2) Initialise terraform, using s3 backend
+# 3) Select the terraform workspace staging
+# 4) Execute terraform apply using the variables-file 00-project.tfvars, the purpose of using the "-var-file=": We can increase the capacity of our resources to support the production environment.
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+Staging Apply:
+  stage: Staging Apply
+  script:
+    - echo "Run Terraform Apply for Staging"
+    - cd deploy/
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - terraform init
+    - terraform workspace select staging
+    - terraform apply -var-file="00-project.tfvars" -auto-approve
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|production)$/'
+
+# Run curl to test of staging application is reachable; when?
+#   - Merge from other branch into production or a direct push into production
+# 1) Wait 5min to let AWS finish spinning up the environment
+# 2) Curl the url of the staging website. If status_code = 200 --> pass; if status_code != 200 --> fail  
+
+Staging Test:
+  stage: Staging Test
+  image: alpine:latest
+  script:
+    - sleep 180
+    - apk add curl
+    - response=$(curl -s -o /dev/null -w "%{http_code}" https://staging.motoyohosting.uk)
+    - if [ $response -eq 200 ]; then echo "Website is reachable."; else echo "Website is not reachable."; exit 1; fi
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|production)$/'
+
+# Run terraform plan for the production environment; when?
+#   - Merge from other branch into  production or a direct push into production
+# 1) Export $ECR_REPO:$CI_COMMIT_SHORT_SHA as TF_VAR_ecr_image_api environment variable (Referenced in the terraform code)
+# 2) Initialise terraform, using s3 backend
+# 3) Select the terraform workspace production, if it does not exist ---> create the workspace production
+# 4) Execute terraform plan using the variables-file 00-project.tfvars, the purpose of using the "-var-file=": We can increase the capacity of our resources to support the production environment.
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+Production Plan:
+  stage: Production Plan
+  script:
+    - echo "Run Terraform Plan for Production"
+    - cd deploy/
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - terraform init
+    - terraform workspace select production || terraform workspace new production
+    - terraform plan -var-file="00-project.tfvars"
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+
+# Run terraform apply for the production environment; when?
+#   - Merge from other branch into production or a direct push into production
+#   !! We need to manually execute the job !!
+# 1) Export $ECR_REPO:$CI_COMMIT_SHORT_SHA as TF_VAR_ecr_image_api environment variable (Referenced in the terraform code)
+# 2) Initialise terraform, using s3 backend
+# 3) Select the terraform workspace production
+# 4) Execute terraform apply using the variables-file 00-project.tfvars, the purpose of using the "-var-file=": 
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+Production Apply:
+  stage: Production Apply
+  script:
+    - echo "Run Terraform Apply for Production"
+    - cd deploy/
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - terraform init
+    - terraform workspace select production
+    - terraform apply -var-file="00-project.tfvars" -auto-approve
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+      when: manual
+
+# Run curl to test of production application is reachable; when?
+#   - Merge from other branch into production or a direct push into production
+# 1) Wait 5min to let AWS finish spinning up the environment
+# 2) Curl the url of the production website. If status_code = 200 --> pass; if status_code != 200 --> fail
+
+Production Test:
+  stage: Production Test
+  image: alpine:latest
+  script:
+    - sleep 180
+    - apk add curl
+    - response=$(curl -s -o /dev/null -w "%{http_code}" https://www.motoyohosting.uk)
+    - if [ $response -eq 200 ]; then echo "Website is reachable."; else echo "Website is not reachable."; exit 1; fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+
+# Run Terraform Destroy for staging; when?
+#   - Merge from other branch into main | production or a direct push into main | production; why also in production? We want to keep our staging environment identical to the production environment
+#   !! We need to manually execute the job !!
+# 1) Initialise terraform, using s3 backend
+# 2) Select the terraform workspace staging
+# 3) Execute terraform destroy using the variables-file 00-project.tfvars, the purpose of using the "-var-file=": 
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+
+Staging Destroy:
+  stage: Destroy
+  script:
+    - echo "Run Terraform Destroy for Staging"
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - cd deploy/
+    - terraform init
+    - terraform workspace select staging
+    - terraform destroy -var-file="00-project.tfvars" -auto-approve
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^(main|production)$/'
+      when: manual
+      
+
+# Run Terraform Destroy for production; when?
+#   - Merge from other branch into production or a direct push into production
+#   !! We need to manually execute the job !!
+# 1) Initialise terraform, using s3 backend
+# 2) Select the terraform workspace production
+# 3) Execute terraform destroy using the variables-file 00-project.tfvars, the purpose of using the "-var-file=": 
+#    We could differentiate between staging & production to increase the capacity of our resources to support the production environment.
+
+Production Destroy:
+  stage: Destroy
+  script:
+    - echo "Run Terraform Destroy for Production"
+    - export TF_VAR_ecr_image_api=$ECR_REPO:$CI_COMMIT_SHORT_SHA
+    - cd deploy/
+    - terraform init
+    - terraform workspace select production
+    - terraform destroy -var-file="00-project.tfvars" -auto-approve
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "production"'
+      when: manual
+
+

@@ -1,0 +1,15 @@
+#Terraform root folder
+deploy/.terraform.lock.hcl
+.env
+deploy/.terraform
+deploy/terraform.tfvars
+deploy/terraform.tfstate
+deploy/terraform.tfstate.backup
+deploy/.certificates
+archive
+
+#Example flask crud
+app/__pycache__
+app/myvenv
+app/app/__pycache__
+
